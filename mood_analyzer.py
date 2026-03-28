@@ -9,9 +9,75 @@ This class starts with very simple logic:
   - Convert that score into a mood label
 """
 
+import re
+import string
 from typing import List, Dict, Tuple, Optional
 
 from dataset import POSITIVE_WORDS, NEGATIVE_WORDS
+
+# Maps emoji strings to placeholder tokens that score_text can treat as signals.
+# Text-style emojis must be checked before punctuation is removed.
+EMOJI_MAP: Dict[str, str] = {
+    # text-style
+    ":)":  "emoji_positive",
+    ":-)": "emoji_positive",
+    ":D":  "emoji_positive",
+    ":-D": "emoji_positive",
+    ":(":  "emoji_negative",
+    ":-(": "emoji_negative",
+    # unicode — labelled to match how people actually use them
+    "😊": "emoji_positive",
+    "😄": "emoji_positive",
+    "😂": "emoji_positive",   # laughter / joy
+    "😭": "emoji_positive",   # often used for overwhelming joy ("i'm shaking 😭")
+    "❤️": "emoji_positive",
+    "🥰": "emoji_positive",
+    "🙃": "emoji_negative",   # sarcasm / passive frustration
+    "😞": "emoji_negative",
+    "😔": "emoji_negative",
+    "😤": "emoji_negative",
+    "💀": "emoji_mixed",      # humor / hyperbole ("i'm dead 💀")
+    "🥲": "emoji_mixed",      # bittersweet
+    "😮‍💨": "emoji_mixed",   # relief mixed with exhaustion
+}
+
+# Expands contractions so negation survives punctuation removal.
+# e.g. "don't" -> "do not"  (the apostrophe would otherwise be stripped first)
+CONTRACTIONS: Dict[str, str] = {
+    "can't":   "cannot",
+    "won't":   "will not",
+    "don't":   "do not",
+    "doesn't": "does not",
+    "didn't":  "did not",
+    "isn't":   "is not",
+    "aren't":  "are not",
+    "wasn't":  "was not",
+    "weren't": "were not",
+    "wouldn't": "would not",
+    "couldn't": "could not",
+    "shouldn't": "should not",
+    "i'm":     "i am",
+    "i've":    "i have",
+    "i'd":     "i would",
+    "i'll":    "i will",
+    "it's":    "it is",
+    "that's":  "that is",
+    "there's": "there is",
+    "they're": "they are",
+    "we're":   "we are",
+    "you're":  "you are",
+}
+
+
+# Words that flip the sentiment of the next token.
+NEGATION_WORDS = {"not", "never", "no", "cannot"}
+
+# Words that double the weight of the next sentiment token.
+AMPLIFIER_WORDS = {"really", "so", "absolutely", "totally", "very", "extremely", "super"}
+
+# Cap how many times any single word can contribute to the score.
+# Prevents "happy happy happy" from dominating while still rewarding repetition.
+MAX_WORD_FREQ = 2
 
 
 class MoodAnalyzer:
@@ -40,50 +106,147 @@ class MoodAnalyzer:
         """
         Convert raw text into a list of tokens the model can work with.
 
-        TODO: Improve this method.
-
-        Right now, it does the minimum:
-          - Strips leading and trailing whitespace
-          - Converts everything to lowercase
-          - Splits on spaces
-
-        Ideas to improve:
-          - Remove punctuation
-          - Handle simple emojis separately (":)", ":-(", "🥲", "😂")
-          - Normalize repeated characters ("soooo" -> "soo")
+        Steps:
+          1. Detect ALL CAPS words (duplicated at the end for extra weight).
+          2. Replace emoji strings with placeholder tokens (e.g. "emoji_positive").
+          3. Lowercase.
+          4. Expand contractions ("don't" -> "do not") so negation survives punctuation removal.
+          5. Normalize repeated characters ("soooo" -> "soo").
+          6. Remove punctuation.
+          7. Split into tokens.
+          8. Duplicate originally-ALL-CAPS tokens for double weight in score_text.
         """
-        cleaned = text.strip().lower()
-        tokens = cleaned.split()
+        # Step 1: record which words are ALL CAPS before lowercasing.
+        # These will be duplicated later so score_text counts them twice.
+        caps_words = {
+            w.strip(string.punctuation).lower()
+            for w in text.split()
+            if w.strip(string.punctuation).isupper()
+            and len(w.strip(string.punctuation)) > 1
+        }
 
-        return tokens
+        # Step 2: replace emoji strings with placeholder tokens before
+        # punctuation removal destroys text-style emojis like ":)".
+        for emoji, placeholder in EMOJI_MAP.items():
+            text = text.replace(emoji, f" {placeholder} ")
+
+        # Step 3: lowercase.
+        text = text.lower()
+
+        # Step 4: expand contractions before punctuation removal strips
+        # apostrophes ("don't" -> "do not", so negation survives).
+        for contraction, expansion in CONTRACTIONS.items():
+            text = re.sub(rf"\b{re.escape(contraction)}\b", expansion, text)
+
+        # Step 5: normalize repeated characters so emphasis is preserved
+        # but words stay matchable ("soooo" -> "soo", "nooo" -> "noo").
+        text = re.sub(r"(.)\1{2,}", r"\1\1", text)
+
+        # Step 6: remove punctuation.
+        text = text.translate(str.maketrans("", "", string.punctuation))
+
+        # Step 7: split into tokens.
+        tokens = text.split()
+
+        # Step 8: duplicate originally-ALL-CAPS tokens so score_text
+        # gives them double weight with no changes required there.
+        result = []
+        for token in tokens:
+            result.append(token)
+            if token in caps_words:
+                result.append(token)
+
+        return result
 
     # ---------------------------------------------------------------------
     # Scoring logic
     # ---------------------------------------------------------------------
 
+    def _score_breakdown(self, text: str) -> Tuple[int, int]:
+        """
+        Core scoring pass. Returns (pos_score, neg_score) separately so
+        predict_label can distinguish "mixed" (both > 0) from "neutral" (both == 0).
+
+        Features applied per token:
+          - Emoji placeholder tokens (from preprocess) → direct signal
+          - Negation words (not, never, no, cannot) → flip next sentiment token
+          - Amplifier words (really, very, absolutely…) → double next sentiment token
+          - Frequency cap (MAX_WORD_FREQ) → each unique word contributes at most twice
+          - ALL CAPS amplification is handled upstream in preprocess (token duplicated)
+        """
+        tokens = self.preprocess(text)
+        pos_score = 0
+        neg_score = 0
+        word_counts: Dict[str, int] = {}
+
+        pending_negate = False
+        pending_amplify = 1
+
+        for token in tokens:
+            # --- negation trigger ---
+            if token in NEGATION_WORDS:
+                pending_negate = True
+                continue
+
+            # --- amplifier trigger ---
+            if token in AMPLIFIER_WORDS:
+                pending_amplify = 2
+                continue
+
+            # --- emoji placeholder tokens ---
+            if token == "emoji_positive":
+                pos_score += pending_amplify
+                pending_negate = False
+                pending_amplify = 1
+                continue
+            if token == "emoji_negative":
+                neg_score += pending_amplify
+                pending_negate = False
+                pending_amplify = 1
+                continue
+            if token == "emoji_mixed":
+                # no score change, but resets pending state
+                pending_negate = False
+                pending_amplify = 1
+                continue
+
+            # --- sentiment words ---
+            is_positive = token in self.positive_words
+            is_negative = token in self.negative_words
+
+            if is_positive or is_negative:
+                word_counts[token] = word_counts.get(token, 0) + 1
+                if word_counts[token] <= MAX_WORD_FREQ:
+                    signal = pending_amplify
+                    if pending_negate:
+                        # flip: "not happy" → negative, "not bad" → positive
+                        if is_positive:
+                            neg_score += signal
+                        else:
+                            pos_score += signal
+                    else:
+                        if is_positive:
+                            pos_score += signal
+                        else:
+                            neg_score += signal
+                pending_negate = False
+                pending_amplify = 1
+            else:
+                # unrecognised word resets pending state so negation/amplification
+                # doesn't accidentally carry across unrelated words
+                pending_negate = False
+                pending_amplify = 1
+
+        return pos_score, neg_score
+
     def score_text(self, text: str) -> int:
         """
         Compute a numeric "mood score" for the given text.
-
-        Positive words increase the score.
-        Negative words decrease the score.
-
-        TODO: You must choose AT LEAST ONE modeling improvement to implement.
-        For example:
-          - Handle simple negation such as "not happy" or "not bad"
-          - Count how many times each word appears instead of just presence
-          - Give some words higher weights than others (for example "hate" < "annoyed")
-          - Treat emojis or slang (":)", "lol", "💀") as strong signals
+        Delegates to _score_breakdown and returns pos_score - neg_score.
+        A positive result means more positive signal; negative means more negative.
         """
-        # TODO: Implement this method.
-        #   1. Call self.preprocess(text) to get tokens.
-        #   2. Loop over the tokens.
-        #   3. Increase the score for positive words, decrease for negative words.
-        #   4. Return the total score.
-        #
-        # Hint: if you implement negation, you may want to look at pairs of tokens,
-        # like ("not", "happy") or ("never", "fun").
-        pass
+        pos_score, neg_score = self._score_breakdown(text)
+        return pos_score - neg_score
 
     # ---------------------------------------------------------------------
     # Label prediction
@@ -105,12 +268,15 @@ class MoodAnalyzer:
         Just remember that whatever labels you return should match the labels
         you use in TRUE_LABELS in dataset.py if you care about accuracy.
         """
-        # TODO: Implement this method.
-        #   1. Call self.score_text(text) to get the numeric score.
-        #   2. Return "positive" if the score is above 0.
-        #   3. Return "negative" if the score is below 0.
-        #   4. Return "neutral" otherwise.
-        pass
+        pos_score, neg_score = self._score_breakdown(text)
+
+        if pos_score > 0 and neg_score > 0:
+            return "mixed"
+        if pos_score > neg_score:
+            return "positive"
+        if neg_score > pos_score:
+            return "negative"
+        return "neutral"
 
     # ---------------------------------------------------------------------
     # Explanations (optional but recommended)
